@@ -1,0 +1,10 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.db
+service_account.json
+.streamlit/secrets.toml
+*.xlsx
+*.csv
+.DS_Store
