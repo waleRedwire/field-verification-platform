@@ -1,6 +1,7 @@
 """
 Folium map helpers.
-Failed verification points = RED markers + RED circles, clean points = GREEN.
+Failed = RED + circle, clean = GREEN.
+Popup shows Agent, Submission date, Audio.
 """
 from typing import Optional, Set
 import pandas as pd
@@ -15,12 +16,23 @@ def create_data_map(
     popup_cols: Optional[list] = None,
     agent_col: Optional[str] = None,
     state_col: Optional[str] = None,
+    audio_col: Optional[str] = None,
+    date_col: Optional[str] = None,
     heat: bool = False,
     satellite: bool = False,
     failed_indexes: Optional[Set] = None
 ) -> folium.Map:
 
-    clean = df[[lat_col, lon_col]].dropna().copy()
+    missing = [c for c in (lat_col, lon_col) if c not in df.columns]
+    if missing:
+        m = folium.Map(location=[9.0, 8.0], zoom_start=6)
+        folium.Marker(
+            [9.0, 8.0],
+            popup=f"Map error: missing columns {missing}"
+        ).add_to(m)
+        return m
+
+    clean = df[[lat_col, lon_col]].copy()
     clean[lat_col] = pd.to_numeric(clean[lat_col], errors="coerce")
     clean[lon_col] = pd.to_numeric(clean[lon_col], errors="coerce")
     clean = clean.dropna()
@@ -28,8 +40,8 @@ def create_data_map(
     if clean.empty:
         return folium.Map(location=[9.0, 8.0], zoom_start=6)
 
-    center_lat = clean[lat_col].mean()
-    center_lon = clean[lon_col].mean()
+    center_lat = float(clean[lat_col].mean())
+    center_lon = float(clean[lon_col].mean())
 
     if satellite:
         m = folium.Map(
@@ -50,8 +62,7 @@ def create_data_map(
     failed_indexes = failed_indexes or set()
 
     if heat:
-        heat_data = clean[[lat_col, lon_col]].values.tolist()
-        HeatMap(heat_data, radius=15, blur=20).add_to(m)
+        HeatMap(clean[[lat_col, lon_col]].values.tolist(), radius=15, blur=20).add_to(m)
     else:
         normal_cluster = MarkerCluster(name="Clean points (green)").add_to(m)
         failed_cluster = MarkerCluster(name="Failed verification (red)").add_to(m)
@@ -61,29 +72,56 @@ def create_data_map(
             try:
                 lat = float(row[lat_col])
                 lon = float(row[lon_col])
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, KeyError):
                 continue
 
             is_failed = idx in failed_indexes
+            parts = []
 
-            popup_parts = []
             if is_failed:
-                popup_parts.append("<b style='color:red'>FAILED VERIFICATION</b>")
+                parts.append("<b style='color:red'>FAILED VERIFICATION</b>")
+
             if agent_col and agent_col in df.columns:
-                popup_parts.append(f"<b>Agent:</b> {row[agent_col]}")
+                parts.append(f"<b>Agent:</b> {row[agent_col]}")
+
+            if date_col and date_col in df.columns:
+                parts.append(f"<b>Submission date:</b> {row[date_col]}")
+
             if state_col and state_col in df.columns:
-                popup_parts.append(f"<b>State:</b> {row[state_col]}")
+                parts.append(f"<b>State:</b> {row[state_col]}")
+
+            if audio_col and audio_col in df.columns:
+                audio_url = row.get(audio_col)
+                if audio_url is not None and str(audio_url).strip() not in ("", "nan", "None"):
+                    url = str(audio_url).strip()
+                    parts.append(
+                        f"<b>Interview audio:</b><br>"
+                        f"<a href='{url}' target='_blank'>Open audio link</a><br>"
+                        f"<small>Use the panel below the map to play &amp; transcribe</small>"
+                    )
+
             for c in popup_cols:
-                if c in df.columns and c not in (agent_col, state_col, lat_col, lon_col):
-                    popup_parts.append(f"<b>{c}:</b> {row[c]}")
-            popup = "<br>".join(popup_parts) if popup_parts else f"Row {idx}"
+                if c in df.columns and c not in (agent_col, state_col, lat_col, lon_col, audio_col, date_col):
+                    parts.append(f"<b>{c}:</b> {row[c]}")
+
+            parts.append(f"<small>Row index: {idx}</small>")
+            popup = "<br>".join(parts) if parts else f"Row {idx}"
 
             color = "red" if is_failed else "green"
             icon = "exclamation-sign" if is_failed else "ok-sign"
 
+            # tooltip for quick info
+            tip = []
+            if agent_col and agent_col in df.columns:
+                tip.append(str(row[agent_col]))
+            if date_col and date_col in df.columns:
+                tip.append(str(row[date_col]))
+            tooltip = " | ".join(tip) if tip else f"Row {idx}"
+
             marker = folium.Marker(
                 location=[lat, lon],
                 popup=folium.Popup(popup, max_width=300),
+                tooltip=tooltip,
                 icon=folium.Icon(color=color, icon=icon)
             )
 
@@ -103,3 +141,17 @@ def create_data_map(
 
     folium.LayerControl().add_to(m)
     return m
+
+
+def find_nearest_row(df: pd.DataFrame, lat_col: str, lon_col: str, click_lat: float, click_lon: float):
+    """Return index of nearest row to clicked map coordinates."""
+    if lat_col not in df.columns or lon_col not in df.columns:
+        return None
+    work = df[[lat_col, lon_col]].copy()
+    work[lat_col] = pd.to_numeric(work[lat_col], errors="coerce")
+    work[lon_col] = pd.to_numeric(work[lon_col], errors="coerce")
+    work = work.dropna()
+    if work.empty:
+        return None
+    dist = (work[lat_col] - click_lat) ** 2 + (work[lon_col] - click_lon) ** 2
+    return dist.idxmin()

@@ -83,7 +83,10 @@ def create_project(name: str, description: str = "") -> int:
         "fuzzy_threshold": 90,
         "gender_col": None,
         "age_col": None,
-        "demographic_targets": {"gender": {}, "age": {}},
+        "demographic_targets": {
+            "gender": {},
+            "age": {}
+        },
         "demographic_by_state": {},
         "pattern_checks": {
             "min_entropy": 1.5,
@@ -93,6 +96,8 @@ def create_project(name: str, description: str = "") -> int:
         "lat_col": None,
         "lon_col": None,
         "agent_col": None,
+        "audio_col": None,
+        "submission_date_col": None,
         "timestamp_col": None,
         "state_col": None,
         "start_time_col": None,
@@ -138,7 +143,15 @@ def get_rules(project_id: int) -> Dict:
     row = cur.fetchone()
     conn.close()
     if row:
-        return json.loads(row["rules_json"])
+        rules = json.loads(row["rules_json"])
+        # Ensure newer keys exist for older projects
+        rules.setdefault("audio_col", None)
+        rules.setdefault("submission_date_col", None)
+        rules.setdefault("demographic_by_state", {})
+        rules.setdefault("cluster_enabled", True)
+        rules.setdefault("cluster_min_points", 5)
+        rules.setdefault("cluster_radius_meters", 100)
+        return rules
     return {}
 
 
@@ -163,7 +176,13 @@ def save_dataset(project_id: int, filename: str, df: pd.DataFrame) -> int:
     cur.execute(
         """INSERT INTO datasets (project_id, filename, uploaded_at, row_count, columns_json)
            VALUES (?, ?, ?, ?, ?)""",
-        (project_id, filename, datetime.utcnow().isoformat(), len(df), json.dumps(list(df.columns)))
+        (
+            project_id,
+            filename,
+            datetime.utcnow().isoformat(),
+            len(df),
+            json.dumps(list(df.columns))
+        )
     )
     dataset_id = cur.lastrowid
     conn.commit()
@@ -177,7 +196,12 @@ def save_run(project_id: int, dataset_id: Optional[int], results: Dict) -> int:
     cur.execute(
         """INSERT INTO verification_runs (project_id, dataset_id, run_at, results_json)
            VALUES (?, ?, ?, ?)""",
-        (project_id, dataset_id, datetime.utcnow().isoformat(), json.dumps(results, default=str))
+        (
+            project_id,
+            dataset_id,
+            datetime.utcnow().isoformat(),
+            json.dumps(results, default=str)
+        )
     )
     run_id = cur.lastrowid
     conn.commit()
@@ -185,4 +209,5 @@ def save_run(project_id: int, dataset_id: Optional[int], results: Dict) -> int:
     return run_id
 
 
+# Initialise database on import
 init_db()
