@@ -1,27 +1,35 @@
 """
 FIELD VERIFICATION PLATFORM
-Map click → Agent + Date + Interview audio → auto play & English transcript
+Per-user projects · Persistent rules · Admin Analysis/Users · Security
 """
 import streamlit as st
 import pandas as pd
-import json
 from io import BytesIO
-from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font
 from openpyxl.utils.dataframe import dataframe_to_rows
 
 from db import (
     create_project, list_projects, get_project,
-    get_rules, save_rules, save_dataset, save_run
+    get_rules, save_rules, save_dataset, save_run,
+    create_user, list_users, set_user_active,
+    user_can_access_project,
 )
+from auth_ui import require_login, logout_button
 from verification import run_full_verification
 from map_utils import create_data_map, find_nearest_row
-from mesbi import run_mesbi, INDICATORS
+from mesbi import run_mesbi
 from audio import download_audio_bytes, transcribe_english
+from security_utils import (
+    escape_text,
+    sanitize_dataframe_for_excel,
+    check_upload_limits,
+    safe_error_message,
+    MAX_ROWS,
+)
 
 try:
-    from google_utils import load_google_sheet, upload_file_to_drive_folder
+    from google_utils import load_google_sheet
     GOOGLE_AVAILABLE = True
 except ImportError:
     GOOGLE_AVAILABLE = False
@@ -35,51 +43,105 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    .stApp { background-color: #f8fafc; color: #1e293b; }
-    .main .block-container { padding-top: 1.5rem; padding-bottom: 2rem; max-width: 1400px; }
-    .app-header {
-        background: linear-gradient(90deg, #1e40af 0%, #1e3a8a 100%);
-        border-radius: 12px; padding: 1.2rem 1.8rem; margin-bottom: 1.5rem;
-        color: white; box-shadow: 0 4px 12px rgba(30, 64, 175, 0.25);
+    .stApp {
+        background: linear-gradient(180deg, #f1f5f9 0%, #f8fafc 40%, #ffffff 100%);
+        color: #0f172a;
     }
-    .app-header h1 { margin: 0; font-size: 1.55rem; font-weight: 700; color: #ffffff; }
-    .app-header .subtitle { color: #bfdbfe; font-size: 0.9rem; margin-top: 0.3rem; }
-    section[data-testid="stSidebar"] { background-color: #ffffff !important; border-right: 1px solid #e2e8f0; }
+    .main .block-container {
+        padding-top: 1.25rem;
+        padding-bottom: 2.5rem;
+        max-width: 1280px;
+    }
+    .app-header {
+        background: linear-gradient(135deg, #1e3a5f 0%, #1e40af 55%, #2563eb 100%);
+        border-radius: 16px;
+        padding: 1.35rem 1.75rem;
+        margin-bottom: 1.25rem;
+        color: white;
+        box-shadow: 0 10px 30px rgba(30, 64, 175, 0.18);
+    }
+    .app-header h1 {
+        margin: 0;
+        font-size: 1.45rem;
+        font-weight: 700;
+        color: #ffffff;
+    }
+    .app-header .subtitle {
+        color: rgba(219, 234, 254, 0.9);
+        font-size: 0.9rem;
+        margin-top: 0.35rem;
+    }
+    section[data-testid="stSidebar"] {
+        background: #ffffff !important;
+        border-right: 1px solid #e2e8f0;
+    }
     div[data-testid="stMetric"] {
-        background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px;
-        padding: 1rem 1.2rem; box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+        background: #ffffff;
+        border: 1px solid #e2e8f0;
+        border-radius: 14px;
+        padding: 1rem 1.15rem;
     }
     .stButton > button[kind="primary"] {
-        background: linear-gradient(90deg, #2563eb, #1d4ed8) !important; border: none !important; color: white !important;
+        background: linear-gradient(135deg, #2563eb, #1d4ed8) !important;
+        border: none !important;
+        color: white !important;
+        border-radius: 10px !important;
+        font-weight: 600 !important;
     }
-    .stTabs [data-baseweb="tab"] { color: #475569 !important; }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 4px;
+        background: #ffffff;
+        padding: 6px;
+        border-radius: 12px;
+        border: 1px solid #e2e8f0;
+    }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 8px;
+        color: #64748b !important;
+        font-weight: 500;
+        padding: 8px 14px;
+    }
     .stTabs [aria-selected="true"] {
-        background-color: #eff6ff !important; color: #1e40af !important; font-weight: 600 !important;
+        background: #eff6ff !important;
+        color: #1e40af !important;
+        font-weight: 600 !important;
+        border: 1px solid #bfdbfe !important;
     }
-    #MainMenu {visibility: hidden;} footer {visibility: hidden;} 
+    #MainMenu { visibility: hidden; }
+    footer { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
 
-if "current_project_id" not in st.session_state:
-    st.session_state.current_project_id = None
-if "df" not in st.session_state:
+user = require_login()
+is_admin = user.get("role") == "admin"
+
+# ---------- Session state ----------
+defaults = {
+    "current_project_id": None,
+    "df": None,
+    "last_report": None,
+    "demo_by_state": {},
+    "mesbi_result": None,
+    "selected_point_idx": None,
+    "point_audio_bytes": None,
+    "point_audio_format": None,
+    "point_audio_url": None,
+    "point_transcript": None,
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+
+def clear_working_data():
     st.session_state.df = None
-if "last_report" not in st.session_state:
     st.session_state.last_report = None
-if "demo_by_state" not in st.session_state:
-    st.session_state.demo_by_state = {}
-if "mesbi_result" not in st.session_state:
     st.session_state.mesbi_result = None
-if "selected_point_idx" not in st.session_state:
     st.session_state.selected_point_idx = None
-if "point_audio_bytes" not in st.session_state:
     st.session_state.point_audio_bytes = None
-if "point_audio_format" not in st.session_state:
-    st.session_state.point_audio_format = None
-if "point_audio_url" not in st.session_state:
-    st.session_state.point_audio_url = None
-if "point_transcript" not in st.session_state:
     st.session_state.point_transcript = None
+    st.session_state.point_audio_url = None
+    st.session_state.demo_by_state = {}
 
 
 def load_data(uploaded_file) -> pd.DataFrame:
@@ -89,10 +151,11 @@ def load_data(uploaded_file) -> pd.DataFrame:
 
 
 def build_colour_coded_excel(pass_fail_df: pd.DataFrame) -> bytes:
+    safe_df = sanitize_dataframe_for_excel(pass_fail_df)
     wb = Workbook()
     ws = wb.active
     ws.title = "Verification Results"
-    for r_idx, row in enumerate(dataframe_to_rows(pass_fail_df, index=False, header=True), 1):
+    for r_idx, row in enumerate(dataframe_to_rows(safe_df, index=False, header=True), 1):
         for c_idx, value in enumerate(row, 1):
             cell = ws.cell(row=r_idx, column=c_idx, value=value)
             if r_idx > 1 and c_idx == 1:
@@ -126,9 +189,17 @@ def load_and_transcribe_point(audio_url: str, use_api: bool, api_key, model_size
 
 
 # ---------- Sidebar ----------
-st.sidebar.markdown("### Projects")
-projects = list_projects()
+st.sidebar.markdown("#### Account")
+st.sidebar.write(f"**{escape_text(user['name'])}**")
+st.sidebar.caption(f"{escape_text(user['username'])} · {escape_text(user['role'])}")
+logout_button()
+st.sidebar.markdown("---")
+st.sidebar.markdown("#### Your projects")
+st.sidebar.caption("Only your projects are listed" if not is_admin else "Admin: all projects visible")
+
+projects = list_projects(user)
 project_names = {p["name"]: p["id"] for p in projects}
+
 selected_name = st.sidebar.selectbox(
     "Select project",
     options=["— create new —"] + list(project_names.keys()),
@@ -141,66 +212,175 @@ if selected_name == "— create new —":
         new_desc = st.text_area("Description", height=80)
         if st.form_submit_button("Create Project"):
             if new_name.strip():
-                pid = create_project(new_name.strip(), new_desc.strip())
-                st.session_state.current_project_id = pid
-                st.rerun()
+                try:
+                    pid = create_project(
+                        new_name.strip(),
+                        new_desc.strip(),
+                        owner_id=user["id"]
+                    )
+                    clear_working_data()
+                    st.session_state.current_project_id = pid
+                    st.rerun()
+                except Exception:
+                    st.sidebar.error("Could not create project (name may already exist for you).")
             else:
                 st.sidebar.error("Name required")
 else:
-    st.session_state.current_project_id = project_names[selected_name]
+    new_id = project_names[selected_name]
+    if st.session_state.current_project_id != new_id:
+        clear_working_data()
+        st.session_state.current_project_id = new_id
 
 st.sidebar.markdown("---")
-st.sidebar.caption("FIELD VERIFICATION PLATFORM  v1.4")
+st.sidebar.caption("Field Verification Platform")
 
+# ---------- Main shell ----------
 if st.session_state.current_project_id is None:
     st.markdown("""
     <div class="app-header"><div>
         <h1>FIELD VERIFICATION PLATFORM</h1>
-        <div class="subtitle">Create or select a project to begin</div>
+        <div class="subtitle">Create or select a project in the sidebar to begin</div>
     </div></div>
     """, unsafe_allow_html=True)
-    st.info("Use the sidebar to create or select a project.")
+    st.info("Your projects and verification rules are saved to your account and will still be here next login.")
+    if not is_admin:
+        st.stop()
+
+project = None
+rules = {}
+if st.session_state.current_project_id is not None:
+    if not user_can_access_project(st.session_state.current_project_id, user):
+        st.error("You do not have access to this project.")
+        st.session_state.current_project_id = None
+        st.stop()
+    project = get_project(st.session_state.current_project_id, user)
+    if project is None:
+        st.error("Project not found or access denied.")
+        st.session_state.current_project_id = None
+        st.stop()
+    rules = get_rules(st.session_state.current_project_id, user)
+    if not st.session_state.demo_by_state and rules.get("demographic_by_state"):
+        st.session_state.demo_by_state = rules.get("demographic_by_state", {})
+    safe_proj = escape_text(project["name"])
+    safe_desc = escape_text(project.get("description") or "")
+    st.markdown(f"""
+    <div class="app-header"><div>
+        <h1>FIELD VERIFICATION PLATFORM</h1>
+        <div class="subtitle">{safe_proj}{(' — ' + safe_desc) if safe_desc else ''}</div>
+    </div></div>
+    """, unsafe_allow_html=True)
+
+# Tabs
+if is_admin:
+    if st.session_state.current_project_id is not None:
+        tab_upload, tab_rules, tab_verify, tab_map, tab_report, tab_analysis, tab_users = st.tabs([
+            "1. Upload Data",
+            "2. Verification Rules",
+            "3. Run Verification",
+            "4. Map",
+            "5. Report",
+            "6. Analysis",
+            "7. Users"
+        ])
+    else:
+        tab_users = st.tabs(["7. Users"])[0]
+        tab_upload = tab_rules = tab_verify = tab_map = tab_report = tab_analysis = None
+else:
+    tab_upload, tab_rules, tab_verify, tab_map, tab_report = st.tabs([
+        "1. Upload Data",
+        "2. Verification Rules",
+        "3. Run Verification",
+        "4. Map",
+        "5. Report"
+    ])
+    tab_analysis = None
+    tab_users = None
+
+# ========== USERS (admin) ==========
+if tab_users is not None:
+    with tab_users:
+        st.subheader("User management")
+        st.caption("Each user only sees their own projects. Rules persist per project.")
+
+        with st.form("create_user_form"):
+            c1, c2 = st.columns(2)
+            with c1:
+                new_username = st.text_input("Username *")
+                new_name = st.text_input("Full name *")
+            with c2:
+                new_email = st.text_input("Email *")
+                new_phone = st.text_input("Phone number")
+            new_role = st.selectbox("Role", ["user", "admin"])
+            create_btn = st.form_submit_button("Create user", type="primary")
+
+        if create_btn:
+            result = create_user(new_username, new_email, new_name, new_phone, role=new_role)
+            if not result["ok"]:
+                st.error(result["error"])
+            else:
+                st.success(f"User **{escape_text(new_username)}** created.")
+                st.warning("Copy the default password now — it will not be shown again.")
+                st.code(result["default_password"], language=None)
+
+        st.markdown("### Existing users")
+        users = list_users()
+        if not users:
+            st.info("No users yet.")
+        else:
+            for u in users:
+                cols = st.columns([2, 2, 2, 1, 1, 1])
+                cols[0].write(f"**{escape_text(u['username'])}**")
+                cols[1].write(escape_text(u["email"]))
+                cols[2].write(escape_text(u.get("name") or ""))
+                cols[3].write(escape_text(u["role"]))
+                cols[4].write("Active" if u["is_active"] else "Off")
+                if u["id"] != user["id"]:
+                    if u["is_active"]:
+                        if cols[5].button("Disable", key=f"dis_{u['id']}"):
+                            set_user_active(u["id"], False)
+                            st.rerun()
+                    else:
+                        if cols[5].button("Enable", key=f"en_{u['id']}"):
+                            set_user_active(u["id"], True)
+                            st.rerun()
+
+if st.session_state.current_project_id is None or tab_upload is None:
     st.stop()
-
-project = get_project(st.session_state.current_project_id)
-rules = get_rules(st.session_state.current_project_id)
-
-if not st.session_state.demo_by_state and rules.get("demographic_by_state"):
-    st.session_state.demo_by_state = rules.get("demographic_by_state", {})
-
-st.markdown(f"""
-<div class="app-header"><div>
-    <h1>FIELD VERIFICATION PLATFORM</h1>
-    <div class="subtitle">{project['name']}{(' — ' + project['description']) if project.get('description') else ''}</div>
-</div></div>
-""", unsafe_allow_html=True)
-
-tab_upload, tab_rules, tab_verify, tab_map, tab_report, tab_analysis = st.tabs([
-    "1. Upload Data",
-    "2. Verification Rules",
-    "3. Run Verification",
-    "4. Map",
-    "5. Report",
-    "6. Analysis"
-])
 
 # ========== 1. UPLOAD ==========
 with tab_upload:
     st.subheader("Load Data")
+    st.caption(f"Limits: max file 25 MB · max {MAX_ROWS:,} rows")
     source = st.radio("Data source", options=["Upload Excel / CSV", "Google Sheet"], horizontal=True)
     if source == "Upload Excel / CSV":
         uploaded = st.file_uploader("Choose file", type=["csv", "xlsx", "xls"])
         if uploaded:
-            try:
-                df = load_data(uploaded)
-                st.session_state.df = df
-                st.success(f"Loaded **{len(df):,}** rows × **{len(df.columns)}** columns")
-                st.dataframe(df.head(20), use_container_width=True)
-                if st.button("Save dataset to project", type="secondary"):
-                    ds_id = save_dataset(st.session_state.current_project_id, uploaded.name, df)
-                    st.success(f"Dataset saved (id={ds_id})")
-            except Exception as e:
-                st.error(f"Failed to read file: {e}")
+            err = check_upload_limits(uploaded)
+            if err:
+                st.error(err)
+            else:
+                try:
+                    df = load_data(uploaded)
+                    err2 = check_upload_limits(None, df)
+                    if err2:
+                        st.error(err2)
+                    else:
+                        st.session_state.df = df
+                        st.success(f"Loaded **{len(df):,}** rows × **{len(df.columns)}** columns")
+                        st.dataframe(df.head(20), use_container_width=True)
+                        if st.button("Save dataset metadata to project", type="secondary"):
+                            ds_id = save_dataset(
+                                st.session_state.current_project_id,
+                                uploaded.name,
+                                df,
+                                user=user
+                            )
+                            if ds_id:
+                                st.success(f"Dataset metadata saved (id={ds_id})")
+                            else:
+                                st.error("Could not save (access denied).")
+                except Exception:
+                    st.error(safe_error_message(Exception()))
     else:
         if not GOOGLE_AVAILABLE:
             st.error("Google libraries not installed.")
@@ -212,17 +392,22 @@ with tab_upload:
                 try:
                     with st.spinner("Loading..."):
                         df = load_google_sheet(sa_file, sheet_url.strip(), worksheet_name.strip() or None)
-                    st.session_state.df = df
-                    st.success(f"Loaded **{len(df):,}** rows")
-                    st.dataframe(df.head(20), use_container_width=True)
-                except Exception as e:
-                    st.error(str(e))
+                    err2 = check_upload_limits(None, df)
+                    if err2:
+                        st.error(err2)
+                    else:
+                        st.session_state.df = df
+                        st.success(f"Loaded **{len(df):,}** rows")
+                        st.dataframe(df.head(20), use_container_width=True)
+                except Exception:
+                    st.error(safe_error_message(Exception()))
     if st.session_state.df is not None:
-        st.caption("Columns: " + ", ".join(list(st.session_state.df.columns)))
+        st.caption("Columns: " + ", ".join(escape_text(c) for c in st.session_state.df.columns))
 
 # ========== 2. RULES ==========
 with tab_rules:
     st.subheader("Verification Settings")
+    st.caption("Saved to this project and restored when you log in again.")
     all_cols = list(st.session_state.df.columns) if st.session_state.df is not None else []
 
     with st.expander("Geographic and Agent Columns", expanded=True):
@@ -337,7 +522,7 @@ with tab_rules:
                 if age_col and age_col in st.session_state.df.columns else []
             )
             for state in states:
-                with st.expander(f"State: {state}", expanded=False):
+                with st.expander(f"State: {escape_text(state)}", expanded=False):
                     current = st.session_state.demo_by_state.get(state, {})
                     cg, ca = current.get("gender", {}), current.get("age", {})
                     g1, g2 = st.columns(2)
@@ -351,9 +536,9 @@ with tab_rules:
                         )
                     age_targets = {}
                     if age_values:
-                        cols = st.columns(min(4, len(age_values)))
+                        cols_a = st.columns(min(4, len(age_values)))
                         for i, val in enumerate(age_values):
-                            with cols[i % len(cols)]:
+                            with cols_a[i % len(cols_a)]:
                                 age_targets[val] = st.number_input(
                                     f"{state} {val}", 0, 100000, int(ca.get(val, 0)), 1, key=f"a_{state}_{val}"
                                 )
@@ -392,9 +577,12 @@ with tab_rules:
             "demographic_targets": {"gender": {}, "age": {}},
             "demographic_by_state": st.session_state.get("demo_by_state", {})
         }
-        save_rules(st.session_state.current_project_id, new_rules)
-        st.success("Rules saved.")
-        st.rerun()
+        ok = save_rules(st.session_state.current_project_id, new_rules, user=user)
+        if ok:
+            st.success("Rules saved. They will still be here next time you log in.")
+            st.rerun()
+        else:
+            st.error("Could not save rules (access denied).")
 
 # ========== 3. VERIFY ==========
 with tab_verify:
@@ -402,12 +590,17 @@ with tab_verify:
     if st.session_state.df is None:
         st.warning("Upload data first.")
     else:
-        if st.button("Run Full Verification", type="primary"):
-            with st.spinner("Running..."):
-                report = run_full_verification(st.session_state.df, rules)
-                st.session_state.last_report = report
-                save_run(st.session_state.current_project_id, None, report)
-            st.success("Done — open Report tab.")
+        if len(st.session_state.df) > MAX_ROWS:
+            st.error(f"Dataset exceeds {MAX_ROWS:,} rows.")
+        elif st.button("Run Full Verification", type="primary"):
+            try:
+                with st.spinner("Running..."):
+                    report = run_full_verification(st.session_state.df, rules)
+                    st.session_state.last_report = report
+                    save_run(st.session_state.current_project_id, None, report, user=user)
+                st.success("Done — open Report tab.")
+            except Exception:
+                st.error(safe_error_message(Exception()))
         if st.session_state.last_report:
             r = st.session_state.last_report
             c1, c2, c3, c4, c5 = st.columns(5)
@@ -420,10 +613,7 @@ with tab_verify:
 # ========== 4. MAP ==========
 with tab_map:
     st.subheader("Geographic Map")
-    st.caption(
-        "Click a point on the map to see **Agent**, **Submission date**, and **Interview audio** "
-        "(downloads, plays, and auto-transcribes below)."
-    )
+    st.caption("Click a point for Agent, date, audio and English transcript.")
 
     if st.session_state.df is None:
         st.warning("Upload data first.")
@@ -438,8 +628,7 @@ with tab_map:
         if not lat or not lon:
             st.info("Set Latitude and Longitude in Verification Rules.")
         elif lat not in st.session_state.df.columns or lon not in st.session_state.df.columns:
-            st.error(f"Lat/lon columns not in data: `{lat}`, `{lon}`. Re-save rules.")
-            st.write("Available:", list(st.session_state.df.columns))
+            st.error("Lat/lon columns not found. Re-save rules after uploading data.")
         else:
             df_map = st.session_state.df.copy()
             failed_indexes = set()
@@ -462,11 +651,7 @@ with tab_map:
             with f3:
                 heat = st.checkbox("Heatmap")
                 satellite = st.checkbox("Satellite")
-                use_api = st.checkbox(
-                    "Whisper via OpenAI API",
-                    value=False,
-                    help="Better on Streamlit Cloud"
-                )
+                use_api = st.checkbox("Whisper via OpenAI API", value=False)
                 model_size = st.selectbox("Local model", ["base", "tiny", "small"], index=0)
 
             api_key = None
@@ -478,7 +663,7 @@ with tab_map:
                 if not api_key:
                     api_key = st.text_input("OpenAI API key", type="password")
 
-            st.caption(f"**{len(df_map)}** points | Red = failed | Green = clean")
+            st.caption(f"**{len(df_map)}** points · Red = failed · Green = clean")
 
             if len(df_map) > 0:
                 m = create_data_map(
@@ -518,12 +703,11 @@ with tab_map:
                         row = df_map.loc[nearest]
                         if audio_col and audio_col in df_map.columns:
                             url = str(row.get(audio_col, "")).strip()
-                            if url and url.lower() not in ("nan", "none", ""):
-                                with st.spinner("Loading interview audio & transcribing (English)..."):
+                            if url and url.lower() not in ("nan", "none", "") and url.lower().startswith(("http://", "https://")):
+                                with st.spinner("Loading audio & transcribing..."):
                                     load_and_transcribe_point(url, use_api, api_key, model_size)
                         st.rerun()
 
-            # Selected interview card
             idx = st.session_state.selected_point_idx
             if idx is not None and idx in st.session_state.df.index:
                 row = st.session_state.df.loc[idx]
@@ -531,28 +715,26 @@ with tab_map:
                 d1, d2, d3 = st.columns(3)
                 with d1:
                     agent_val = row[agent_col] if agent_col and agent_col in row.index else "—"
-                    st.markdown(f"**Agent**  \n{agent_val}")
+                    st.markdown(f"**Agent**  \n{escape_text(agent_val)}")
                 with d2:
                     date_val = row[date_col] if date_col and date_col in row.index else "—"
-                    st.markdown(f"**Submission date**  \n{date_val}")
+                    st.markdown(f"**Submission date**  \n{escape_text(date_val)}")
                 with d3:
                     state_val = row[state_col] if state_col and state_col in row.index else "—"
-                    st.markdown(f"**State**  \n{state_val}")
+                    st.markdown(f"**State**  \n{escape_text(state_val)}")
 
                 if audio_col and audio_col in row.index:
                     url = str(row.get(audio_col, "")).strip()
                     if url and url.lower() not in ("nan", "none", ""):
-                        st.markdown(f"**Interview** · [source link]({url})")
+                        if url.lower().startswith(("http://", "https://")):
+                            st.markdown(f"**Interview** · [source link]({url})")
                         if st.session_state.point_audio_bytes and st.session_state.point_audio_url == url:
                             fmt = st.session_state.point_audio_format or "mp3"
                             st.audio(st.session_state.point_audio_bytes, format=f"audio/{fmt}")
-                        else:
-                            st.info("Click the map point again if audio did not load, or check the URL.")
-
                         if st.session_state.point_transcript:
                             tr = st.session_state.point_transcript
                             if tr.get("error"):
-                                st.error(tr["error"])
+                                st.error(escape_text(tr["error"]))
                             else:
                                 st.markdown("**English transcript**")
                                 st.text_area(
@@ -561,10 +743,6 @@ with tab_map:
                                     height=200,
                                     label_visibility="collapsed"
                                 )
-                    else:
-                        st.warning("No audio link for this point.")
-                else:
-                    st.info("Set Audio URL column in Verification Rules to play interviews.")
             else:
                 st.info("Click a point on the map to open the interview.")
 
@@ -598,30 +776,35 @@ with tab_report:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
-# ========== 6. ANALYSIS ==========
-with tab_analysis:
-    st.subheader("Analysis")
-    if st.session_state.df is None:
-        st.warning("Upload data first.")
-    else:
-        if st.button("Run MESBI", type="primary"):
-            with st.spinner("MESBI..."):
-                st.session_state.mesbi_result = run_mesbi(st.session_state.df, match_threshold=90)
-        if st.session_state.mesbi_result:
-            r = st.session_state.mesbi_result
-            if r.get("mesbi_score") is not None:
-                st.metric("MESBI Score", f"{r['mesbi_score']:.4f}")
-            if r.get("indicator_averages"):
-                st.dataframe(pd.DataFrame([
-                    {"Indicator": k, "Average": v} for k, v in r["indicator_averages"].items()
-                ]), use_container_width=True)
-            if r.get("dimension_scores"):
-                st.dataframe(pd.DataFrame([
-                    {
-                        "Dimension": k,
-                        "Name": v["name"],
-                        "Score": v["score"],
-                        "Weight": v["weight"]
-                    }
-                    for k, v in r["dimension_scores"].items()
-                ]), use_container_width=True)
+# ========== 6. ANALYSIS (admin) ==========
+if tab_analysis is not None:
+    with tab_analysis:
+        st.subheader("Analysis")
+        st.caption("Admin only")
+        if st.session_state.df is None:
+            st.warning("Upload data first.")
+        else:
+            if st.button("Run MESBI", type="primary"):
+                try:
+                    with st.spinner("MESBI..."):
+                        st.session_state.mesbi_result = run_mesbi(st.session_state.df, match_threshold=90)
+                except Exception:
+                    st.error(safe_error_message(Exception()))
+            if st.session_state.mesbi_result:
+                r = st.session_state.mesbi_result
+                if r.get("mesbi_score") is not None:
+                    st.metric("MESBI Score", f"{r['mesbi_score']:.4f}")
+                if r.get("indicator_averages"):
+                    st.dataframe(pd.DataFrame([
+                        {"Indicator": k, "Average": v} for k, v in r["indicator_averages"].items()
+                    ]), use_container_width=True)
+                if r.get("dimension_scores"):
+                    st.dataframe(pd.DataFrame([
+                        {
+                            "Dimension": k,
+                            "Name": v["name"],
+                            "Score": v["score"],
+                            "Weight": v["weight"]
+                        }
+                        for k, v in r["dimension_scores"].items()
+                    ]), use_container_width=True)
