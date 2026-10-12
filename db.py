@@ -1,5 +1,5 @@
 """
-SQLite: projects (owner-scoped), rules, datasets, runs, users.
+SQLite database: users, owner-scoped projects, rules, datasets, runs.
 """
 import sqlite3
 import json
@@ -56,7 +56,7 @@ def init_db():
         )
     """)
 
-    # Migration: add owner_id if old DB lacks it
+    # Migration for older DBs
     cur.execute("PRAGMA table_info(projects)")
     cols = {row[1] for row in cur.fetchall()}
     if "owner_id" not in cols:
@@ -98,11 +98,12 @@ def init_db():
         )
     """)
 
-    # Unique project name per owner (not global)
-    cur.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_owner_name
-        ON projects(owner_id, name)
-    """)
+    try:
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_owner_name ON projects(owner_id, name)"
+        )
+    except sqlite3.OperationalError:
+        pass
 
     conn.commit()
     conn.close()
@@ -137,8 +138,7 @@ def ensure_admin_user(username: str, email: str, name: str, password: str) -> No
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT id FROM users WHERE role = 'admin' LIMIT 1")
-    row = cur.fetchone()
-    if row:
+    if cur.fetchone():
         conn.close()
         return
     now = datetime.utcnow().isoformat()
@@ -251,10 +251,7 @@ def set_user_active(user_id: int, active: bool) -> None:
     conn.close()
 
 
-# ---------- Projects (owner-scoped) ----------
-
 def user_can_access_project(project_id: int, user: Dict) -> bool:
-    """Admin can access all; others only own projects."""
     if not user:
         return False
     if user.get("role") == "admin":
@@ -269,17 +266,8 @@ def user_can_access_project(project_id: int, user: Dict) -> bool:
     return row["owner_id"] == user["id"]
 
 
-def create_project(name: str, description: str = "", owner_id: Optional[int] = None) -> int:
-    conn = get_connection()
-    cur = conn.cursor()
-    now = datetime.utcnow().isoformat()
-    cur.execute(
-        """INSERT INTO projects (name, description, owner_id, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?)""",
-        (name, description, owner_id, now, now)
-    )
-    project_id = cur.lastrowid
-    default_rules = {
+def _default_rules() -> Dict:
+    return {
         "duplicate_keys": [],
         "fuzzy_threshold": 90,
         "gender_col": None,
@@ -306,9 +294,21 @@ def create_project(name: str, description: str = "", owner_id: Optional[int] = N
         "cluster_min_points": 5,
         "cluster_radius_meters": 100,
     }
+
+
+def create_project(name: str, description: str = "", owner_id: Optional[int] = None) -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+    now = datetime.utcnow().isoformat()
+    cur.execute(
+        """INSERT INTO projects (name, description, owner_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (name, description, owner_id, now, now)
+    )
+    project_id = cur.lastrowid
     cur.execute(
         "INSERT INTO project_rules (project_id, rules_json) VALUES (?, ?)",
-        (project_id, json.dumps(default_rules))
+        (project_id, json.dumps(_default_rules()))
     )
     conn.commit()
     conn.close()
@@ -316,16 +316,10 @@ def create_project(name: str, description: str = "", owner_id: Optional[int] = N
 
 
 def list_projects(user: Optional[Dict] = None) -> List[Dict]:
-    """
-    If user is admin → all projects.
-    If user is staff → only projects they own.
-    If user is None → empty (safe default).
-    """
+    if user is None:
+        return []
     conn = get_connection()
     cur = conn.cursor()
-    if user is None:
-        conn.close()
-        return []
     if user.get("role") == "admin":
         cur.execute("""
             SELECT p.*, u.username AS owner_username
