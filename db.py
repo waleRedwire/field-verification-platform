@@ -25,14 +25,49 @@ except ImportError:
 
 
 def _get_database_url() -> Optional[str]:
-    if HAS_STREAMLIT:
-        try:
-            url = st.secrets.get("DATABASE_URL")
-            if url:
-                return str(url).strip()
-        except Exception:
-            pass
-    return os.environ.get("DATABASE_URL")
+    """Resolve DATABASE_URL from env or Streamlit secrets (top-level or nested)."""
+    env_url = os.environ.get("DATABASE_URL")
+    if env_url and str(env_url).strip():
+        return str(env_url).strip()
+
+    if not HAS_STREAMLIT:
+        return None
+
+    # Top-level: DATABASE_URL = "..."
+    try:
+        if "DATABASE_URL" in st.secrets:
+            val = st.secrets["DATABASE_URL"]
+            if val and str(val).strip():
+                return str(val).strip()
+    except Exception:
+        pass
+
+    # Nested under [admin] by mistake
+    try:
+        admin = st.secrets.get("admin", None)
+        if admin is not None:
+            try:
+                val = admin["DATABASE_URL"]
+            except Exception:
+                val = admin.get("DATABASE_URL") if hasattr(admin, "get") else None
+            if val and str(val).strip():
+                return str(val).strip()
+    except Exception:
+        pass
+
+    # Any secret value that looks like a postgres URI
+    try:
+        for k in st.secrets.keys():
+            try:
+                v = st.secrets[k]
+                if isinstance(v, str) and v.strip().lower().startswith("postgresql://"):
+                    return v.strip()
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return None
 
 
 def _use_postgres() -> bool:
