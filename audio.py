@@ -1,122 +1,77 @@
 """
-Download audio from URL, then play / transcribe as English.
-Hausa / Yoruba / Igbo field audio is treated as translated English.
+Audio helpers: download from URL. Transcription optional via OpenAI API only.
+Local Whisper removed for lighter Cloud deploys.
 """
-from typing import Optional, Dict, Any, Tuple
-import os
+from typing import Optional, Tuple, Dict, Any
 import tempfile
+from pathlib import Path
 import requests
 
-_whisper_model = None
 
-
-def _get_whisper(model_size: str = "base"):
-    global _whisper_model
-    if _whisper_model is None:
-        import whisper
-        _whisper_model = whisper.load_model(model_size)
-    return _whisper_model
-
-
-def download_audio_bytes(url: str, timeout: int = 90) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
+def download_audio_bytes(url: str, timeout: int = 60) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
     """
-    Download audio from URL.
-    Returns (bytes, suggested_suffix, error_message).
+    Returns (data, suffix, error).
+    Only http(s) URLs allowed.
     """
-    if not url or str(url).strip() in ("", "nan", "None"):
+    if not url or not str(url).strip():
         return None, None, "Empty audio URL"
-
     url = str(url).strip()
+    if not url.lower().startswith(("http://", "https://")):
+        return None, None, "Only http/https audio links are allowed"
+
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; FieldVerificationPlatform/1.0)"
-        }
-        r = requests.get(url, stream=True, timeout=timeout, headers=headers, allow_redirects=True)
+        r = requests.get(url, timeout=timeout, stream=True)
         r.raise_for_status()
-
-        content_type = (r.headers.get("Content-Type") or "").lower()
-        suffix = ".mp3"
-        lower = url.lower()
-        if ".wav" in lower or "wav" in content_type:
-            suffix = ".wav"
-        elif ".m4a" in lower or "mp4" in content_type or "m4a" in content_type:
-            suffix = ".m4a"
-        elif ".ogg" in lower or "ogg" in content_type:
-            suffix = ".ogg"
-        elif ".webm" in lower or "webm" in content_type:
-            suffix = ".webm"
-        elif "mpeg" in content_type or "mp3" in content_type:
-            suffix = ".mp3"
-
         data = r.content
-        if not data or len(data) < 100:
-            return None, None, "Downloaded file is empty or too small (link may require login)."
-
+        # guess extension
+        suffix = ".mp3"
+        ct = (r.headers.get("Content-Type") or "").lower()
+        if "wav" in ct:
+            suffix = ".wav"
+        elif "ogg" in ct:
+            suffix = ".ogg"
+        elif "m4a" in ct or "mp4" in ct:
+            suffix = ".m4a"
+        elif url.lower().endswith((".wav", ".mp3", ".ogg", ".m4a", ".webm")):
+            suffix = "." + url.lower().rsplit(".", 1)[-1].split("?")[0]
         return data, suffix, None
     except Exception as e:
-        return None, None, f"Download failed: {e}"
-
-
-def download_audio_to_temp(url: str, timeout: int = 90) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Download to a temp file.
-    Returns (path, error).
-    """
-    data, suffix, err = download_audio_bytes(url, timeout=timeout)
-    if err or data is None:
-        return None, err or "Download failed"
-
-    try:
-        fd, path = tempfile.mkstemp(suffix=suffix or ".mp3")
-        os.close(fd)
-        with open(path, "wb") as f:
-            f.write(data)
-        return path, None
-    except Exception as e:
-        return None, str(e)
+        return None, None, f"Could not download audio: {e}"
 
 
 def transcribe_english(
-    audio_path_or_url: str,
+    audio_url: str,
     model_size: str = "base",
     use_openai_api: bool = False,
-    openai_api_key: Optional[str] = None
+    openai_api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    result = {"text": None, "error": None, "source": None}
-    path = audio_path_or_url
-    cleanup = False
+    """
+    Transcription only if OpenAI API is enabled and a key is provided.
+    Local Whisper is disabled.
+    """
+    if not use_openai_api or not openai_api_key:
+        return {
+            "text": None,
+            "error": "Transcription is off. Enable OpenAI API and set a key, or play audio only.",
+        }
 
-    if str(audio_path_or_url).startswith("http"):
-        path, err = download_audio_to_temp(audio_path_or_url)
-        cleanup = True
-        if err or not path:
-            result["error"] = err or "Could not download audio."
-            return result
+    data, suffix, err = download_audio_bytes(audio_url)
+    if err:
+        return {"text": None, "error": err}
 
     try:
-        if use_openai_api and openai_api_key:
-            from openai import OpenAI
-            client = OpenAI(api_key=openai_api_key)
-            with open(path, "rb") as f:
-                tr = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=f,
-                    language="en"
-                )
-            result["text"] = (tr.text or "").strip()
-            result["source"] = "openai-api"
-        else:
-            model = _get_whisper(model_size)
-            tr = model.transcribe(path, language="en", task="transcribe")
-            result["text"] = (tr.get("text") or "").strip()
-            result["source"] = f"local-whisper-{model_size}"
+        from openai import OpenAI
+        client = OpenAI(api_key=openai_api_key)
+        with tempfile.NamedTemporaryFile(suffix=suffix or ".mp3", delete=False) as tmp:
+            tmp.write(data)
+            tmp_path = tmp.name
+        with open(tmp_path, "rb") as f:
+            result = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=f,
+                language="en",
+            )
+        Path(tmp_path).unlink(missing_ok=True)
+        return {"text": result.text, "error": None}
     except Exception as e:
-        result["error"] = str(e)
-    finally:
-        if cleanup and path and os.path.exists(path):
-            try:
-                os.remove(path)
-            except Exception:
-                pass
-
-    return result
+        return {"text": None, "error": f"API transcription failed: {e}"}

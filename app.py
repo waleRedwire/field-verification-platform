@@ -1,6 +1,7 @@
 """
 FIELD VERIFICATION PLATFORM
 Per-user projects · Persistent rules · Admin Analysis/Users · Security
+Temporary: sidebar shows SQLite vs Postgres
 """
 import streamlit as st
 import pandas as pd
@@ -14,6 +15,7 @@ from db import (
     get_rules, save_rules, save_dataset, save_run,
     create_user, list_users, set_user_active,
     user_can_access_project,
+    _use_postgres, _get_database_url,
 )
 from auth_ui import require_login, logout_button
 from verification import run_full_verification
@@ -115,7 +117,17 @@ st.markdown("""
 user = require_login()
 is_admin = user.get("role") == "admin"
 
-# ---------- Session state ----------
+# --- TEMP: which database is active ---
+_using_pg = _use_postgres()
+st.sidebar.markdown("#### Database status")
+st.sidebar.caption("Postgres/Supabase" if _using_pg else "SQLite (local) — DATABASE_URL not loaded")
+if _using_pg:
+    _url = _get_database_url() or ""
+    _host = _url.split("@")[-1][:50] if "@" in _url else "?"
+    st.sidebar.caption(f"Host: {_host}")
+st.sidebar.markdown("---")
+# --- end TEMP ---
+
 defaults = {
     "current_project_id": None,
     "df": None,
@@ -188,7 +200,6 @@ def load_and_transcribe_point(audio_url: str, use_api: bool, api_key, model_size
     st.session_state.point_transcript = out
 
 
-# ---------- Sidebar ----------
 st.sidebar.markdown("#### Account")
 st.sidebar.write(f"**{escape_text(user['name'])}**")
 st.sidebar.caption(f"{escape_text(user['username'])} · {escape_text(user['role'])}")
@@ -234,7 +245,6 @@ else:
 st.sidebar.markdown("---")
 st.sidebar.caption("Field Verification Platform")
 
-# ---------- Main shell ----------
 if st.session_state.current_project_id is None:
     st.markdown("""
     <div class="app-header"><div>
@@ -270,7 +280,6 @@ if st.session_state.current_project_id is not None:
     </div></div>
     """, unsafe_allow_html=True)
 
-# Tabs
 if is_admin:
     if st.session_state.current_project_id is not None:
         tab_upload, tab_rules, tab_verify, tab_map, tab_report, tab_analysis, tab_users = st.tabs([
@@ -296,7 +305,6 @@ else:
     tab_analysis = None
     tab_users = None
 
-# ========== USERS (admin) ==========
 if tab_users is not None:
     with tab_users:
         st.subheader("User management")
@@ -347,7 +355,6 @@ if tab_users is not None:
 if st.session_state.current_project_id is None or tab_upload is None:
     st.stop()
 
-# ========== 1. UPLOAD ==========
 with tab_upload:
     st.subheader("Load Data")
     st.caption(f"Limits: max file 25 MB · max {MAX_ROWS:,} rows")
@@ -404,7 +411,6 @@ with tab_upload:
     if st.session_state.df is not None:
         st.caption("Columns: " + ", ".join(escape_text(c) for c in st.session_state.df.columns))
 
-# ========== 2. RULES ==========
 with tab_rules:
     st.subheader("Verification Settings")
     st.caption("Saved to this project and restored when you log in again.")
@@ -584,7 +590,6 @@ with tab_rules:
         else:
             st.error("Could not save rules (access denied).")
 
-# ========== 3. VERIFY ==========
 with tab_verify:
     st.subheader("Run Full Verification")
     if st.session_state.df is None:
@@ -610,7 +615,6 @@ with tab_verify:
             c4.metric("Short Interviews", r.get("duration_check", {}).get("flagged_short_count", 0))
             c5.metric("Clusters", r.get("cluster_check", {}).get("flagged_count", 0))
 
-# ========== 4. MAP ==========
 with tab_map:
     st.subheader("Geographic Map")
     st.caption("Click a point for Agent, date, audio and English transcript.")
@@ -746,7 +750,6 @@ with tab_map:
             else:
                 st.info("Click a point on the map to open the interview.")
 
-# ========== 5. REPORT ==========
 with tab_report:
     st.subheader("Verification Report")
     if not st.session_state.last_report:
@@ -776,7 +779,6 @@ with tab_report:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
-# ========== 6. ANALYSIS (admin) ==========
 if tab_analysis is not None:
     with tab_analysis:
         st.subheader("Analysis")
