@@ -1,7 +1,6 @@
 """
 FIELD VERIFICATION PLATFORM
 Per-user projects · Persistent rules · Admin Analysis/Users · Security
-Temporary: sidebar shows SQLite vs Postgres
 """
 import streamlit as st
 import pandas as pd
@@ -15,7 +14,6 @@ from db import (
     get_rules, save_rules, save_dataset, save_run,
     create_user, list_users, set_user_active,
     user_can_access_project,
-    _use_postgres, _get_database_url,
 )
 from auth_ui import require_login, logout_button
 from verification import run_full_verification
@@ -116,17 +114,6 @@ st.markdown("""
 
 user = require_login()
 is_admin = user.get("role") == "admin"
-
-# --- TEMP: which database is active ---
-_using_pg = _use_postgres()
-st.sidebar.markdown("#### Database status")
-st.sidebar.caption("Postgres/Supabase" if _using_pg else "SQLite (local) — DATABASE_URL not loaded")
-if _using_pg:
-    _url = _get_database_url() or ""
-    _host = _url.split("@")[-1][:50] if "@" in _url else "?"
-    st.sidebar.caption(f"Host: {_host}")
-st.sidebar.markdown("---")
-# --- end TEMP ---
 
 defaults = {
     "current_project_id": None,
